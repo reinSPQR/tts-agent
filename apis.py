@@ -6,7 +6,7 @@ import json
 import asyncio
 import base64
 import uvicorn
-from typing import Dict, Any, Optional, List
+from typing import AsyncGenerator, Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 import logging
 from datetime import datetime, timedelta
@@ -20,9 +20,17 @@ import torchaudio
 from fastapi.responses import StreamingResponse
 from huggingface_hub import snapshot_download
 
-from boson_multimodal.serve.serve_engine import HiggsAudioResponse, HiggsAudioServeEngine
+from boson_multimodal.serve.serve_engine import HiggsAudioStreamerDelta, HiggsAudioResponse, HiggsAudioServeEngine
 from boson_multimodal.data_types import ChatMLSample, Message, AudioContent
-from oai_models import ChatCompletionRequest
+from oai_models import ChatCompletionMessageParam, ChatCompletionRequest
+from schema import AudioChunk, ResponseStatus, TaskStatus
+
+
+async def send_chunk(chunk_obj):
+    """Helper to send chunk with optimized JSON serialization"""
+    # Use model_dump_json() to properly handle datetime serialization
+    chunk_json = chunk_obj.model_dump_json()
+    yield f"data: {chunk_json}\n\n"
 
 
 load_dotenv()
@@ -57,13 +65,16 @@ async def initialize_serve_engine():
     """Initialize the FLUX.1-Krea-dev image generation pipeline"""
     global serve_engine
     try:
-        logger.info(f"Downloading {config.model_repo}...")
-        snapshot_download(repo_id=config.model_repo)
-        logger.info(f"Downloading {config.audio_tokenizer_repo}...")
-        snapshot_download(repo_id=config.audio_tokenizer_repo)
+        model_dir = os.path.join("./checkpoints", config.model_repo)
+        logger.info(f"Downloading {config.model_repo} to {model_dir}")
+        snapshot_download(repo_id=config.model_repo, local_dir=model_dir)
+
+        audio_tokenizer_dir = os.path.join("./checkpoints", config.audio_tokenizer_repo)
+        logger.info(f"Downloading {config.audio_tokenizer_repo} to {audio_tokenizer_dir}")
+        snapshot_download(repo_id=config.audio_tokenizer_repo, local_dir=audio_tokenizer_dir)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        serve_engine = HiggsAudioServeEngine(config.model_repo, config.audio_tokenizer_repo, device=device)
+        serve_engine = HiggsAudioServeEngine(model_dir, audio_tokenizer_dir, device=device)
         
         logger.info("Serve engine initialized successfully")
     except Exception as e:
@@ -105,18 +116,64 @@ app = FastAPI(
 )
 
 
+def openai_messages_to_chatml_messages(messages: List[ChatCompletionMessageParam]) -> List[Message]:
+    return [Message(**message) for message in messages]
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, original_request: Request):
-    output: HiggsAudioResponse = serve_engine.generate(
-        chat_ml_sample=ChatMLSample(messages=request.messages),
-        max_new_tokens=1024,
-        temperature=0.3,
-        top_p=0.95,
-        top_k=50,
-        stop_strings=["<|end_of_text|>", "<|eot_id|>"],
+    async def optimized_stream_generator():
+        try:
+            task_id = str(uuid.uuid4())
+
+            streamer: AsyncGenerator[HiggsAudioStreamerDelta, None] = serve_engine.generate_delta_stream(
+                chat_ml_sample=ChatMLSample(messages=openai_messages_to_chatml_messages(request.messages)),
+                max_new_tokens=request.max_completion_tokens or 1024,
+                temperature=request.temperature or 0.3,
+                top_p=request.top_p or 0.95,
+                top_k=request.top_k or 50,
+                stop_strings=["<|end_of_text|>", "<|eot_id|>"],
+                seed=request.seed or 42,
+            )
+            
+            async for delta in streamer:
+                is_final_chunk = delta.text is not None
+
+                chunk_obj = AudioChunk(
+                    id=task_id,
+                    audio=delta.audio_tokens.tolist() if delta.audio_tokens is not None else [],
+                    status=ResponseStatus(status=TaskStatus.COMPLETED, progress=99.0, estimated_wait_time=None),
+                    finish_reason="stop" if is_final_chunk else None,
+                    sampling_rate=serve_engine.audio_tokenizer.sampling_rate,
+                )
+
+                async for chunk in send_chunk(chunk_obj):
+                    yield chunk
+
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error(f"Error in image stream generator for task {task_id}: {e}", exc_info=True)
+            try:
+                async for chunk in send_chunk(AudioChunk(
+                    id=task_id,
+                    content=f"Stream error: {str(e)}",
+                    status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
+                    finish_reason="error"
+                )):
+                    yield chunk
+                yield "data: [DONE]\n\n"
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup for task {task_id}: {cleanup_error}", exc_info=True)
+    
+    return StreamingResponse(optimized_stream_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
     )
-    torchaudio.save(f"output.wav", torch.from_numpy(output.audio)[None, :], output.sampling_rate)
 
 
 if __name__ == "__main__":

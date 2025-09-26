@@ -47,4 +47,4 @@ COPY . .
 EXPOSE 8000
 
 # Set the default command
-CMD ["python", "apis.py"] 
+CMD ["python", "apis.py"]

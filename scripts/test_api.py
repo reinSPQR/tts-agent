@@ -113,9 +113,10 @@ async def generate_audio_from_api(sample):
 
             try:
                 data = json.loads(current_chunk)
-                print(data)
                 audio_data.extend(data["audio"])
                 sampling_rate = data["sampling_rate"]
+                
+                print(f"Received audio chunk of length {len(data["audio"])}")
             except json.JSONDecodeError:
                 pass
 

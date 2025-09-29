@@ -149,8 +149,6 @@ async def chat_completions(request: AudioGenerationRequest, original_request: Re
                     
                     vq_code = revert_delay_pattern(audio_chunk).clip(0, serve_engine.audio_codebook_size - 1)
                     wv_numpy = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
-
-                    print(wv_numpy.tolist())
                 
                     # Calculate how many tokens to keep for next chunk
                     # We need to preserve the tokens that were cut off by the delay pattern
@@ -168,6 +166,9 @@ async def chat_completions(request: AudioGenerationRequest, original_request: Re
                             sampling_rate=serve_engine.audio_tokenizer.sampling_rate,
                         )
 
+                        async for chunk in send_chunk(chunk_obj):
+                            yield chunk
+
                     if is_final_chunk:
                         chunk_obj = AudioChunk(
                             id=task_id,
@@ -178,8 +179,8 @@ async def chat_completions(request: AudioGenerationRequest, original_request: Re
                             sampling_rate=serve_engine.audio_tokenizer.sampling_rate,
                         )
 
-                    async for chunk in send_chunk(chunk_obj):
-                        yield chunk
+                        async for chunk in send_chunk(chunk_obj):
+                            yield chunk
 
             yield "data: [DONE]\n\n"
         except Exception as e:

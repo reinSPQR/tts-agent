@@ -97,8 +97,6 @@ chunk_size = 64
 async def process_audio_tokens_to_pcm(delta, serve_engine):
     global audio_token_buffer, audio_data
 
-    # print(f"delta: {delta}", file=sys.stderr)
-
     if delta.audio_tokens is not None:
         audio_token_buffer.append(delta.audio_tokens)
 
@@ -184,9 +182,10 @@ async def generate_audio_from_api(sample):
 
             try:
                 data = json.loads(current_chunk)
-                print(data)
                 audio_data.extend(data["audio"])
                 sampling_rate = data["sampling_rate"]
+
+                print(f"Generated audio chunk of length {len(data["audio"])}")
             except json.JSONDecodeError:
                 pass
 

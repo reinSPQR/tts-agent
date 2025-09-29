@@ -37,7 +37,7 @@ class AudioChunk(BaseModelWithDatetime):
     """Individual image data in the response"""
     id: str = Field(..., description="Request identifier - same for all chunks in a request")
     content: Optional[str] = Field(None, description="The content of the chunk")
-    audio: List[int] = Field([], description="The audio data")
+    audio: List[float] = Field([], description="The audio data")
     status: ResponseStatus = Field(..., description="The status of the response")
     sampling_rate: int = Field(0, description="The sampling rate of the audio")
     finish_reason: Union[Literal["stop", "error"], None] = Field(None, description="The finish reason of the chunk")

@@ -1,4 +1,5 @@
 from enum import Enum
+from boson_multimodal.data_types import Message
 from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 from typing import List, Optional, Union, Literal
@@ -40,3 +41,13 @@ class AudioChunk(BaseModelWithDatetime):
     status: ResponseStatus = Field(..., description="The status of the response")
     sampling_rate: int = Field(0, description="The sampling rate of the audio")
     finish_reason: Union[Literal["stop", "error"], None] = Field(None, description="The finish reason of the chunk")
+
+
+class AudioGenerationRequest(BaseModel):
+    """Request schema for audio generation"""
+    messages: List[Message]
+    max_completion_tokens: int = Field(1024)
+    temperature: float = Field(0.3)
+    top_p: float = Field(0.95)
+    top_k: int = Field(50)
+    seed: int = Field(42)

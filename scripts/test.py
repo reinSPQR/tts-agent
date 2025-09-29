@@ -1,10 +1,15 @@
 import base64
 import json
 import os
+import sys
+import numpy as np
 from dataclasses import asdict
+from typing import AsyncGenerator
 from boson_multimodal.data_types import ChatMLSample, Message, AudioContent
 import asyncio
 
+from boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
+from boson_multimodal.serve.serve_engine import HiggsAudioResponse, HiggsAudioServeEngine, HiggsAudioStreamerDelta
 import requests
 import torch
 import torchaudio
@@ -65,7 +70,7 @@ def get_zero_shot_input_sample():
 def get_voice_clone_input_sample():
     reference_text = "I would imagine so. A wand with a dragon heartstring core is capable of dazzling magic."
     reference_audio = encode_base64_content_from_file(
-        os.path.join(os.path.dirname(__file__), "scripts/voice_examples/old_man.wav")
+        os.path.join(os.path.dirname(__file__), "voice_examples/old_man.wav")
     )
     messages = [
         Message(
@@ -79,16 +84,82 @@ def get_voice_clone_input_sample():
         Message(
             role="user",
             content="Hey, everyone! Welcome back to Tech Talk Tuesdays.\n"
-            "It's your host, Alex, and today, we're diving into a topic that's become absolutely crucial in the tech world — deep learning.\n"
-            "And let's be honest, if you've been even remotely connected to tech, AI, or machine learning lately, you know that deep learning is everywhere.",
+            # "It's your host, Alex, and today, we're diving into a topic that's become absolutely crucial in the tech world — deep learning.\n"
+            # "And let's be honest, if you've been even remotely connected to tech, AI, or machine learning lately, you know that deep learning is everywhere.",
         ),
     ]
     return ChatMLSample(messages=messages)
 
 
-async def run_test():
-    sample = get_zero_shot_input_sample()
+# Global buffer to accumulate audio tokens for streaming
+audio_token_buffer = []
+audio_data = []
+chunk_size = 64
 
+async def process_audio_tokens_to_pcm(delta, serve_engine):
+    global audio_token_buffer, audio_data
+
+    # print(f"delta: {delta}", file=sys.stderr)
+
+    if delta.audio_tokens is not None:
+        audio_token_buffer.append(delta.audio_tokens)
+
+    if len(audio_token_buffer) >= chunk_size or delta.text == "<|eot_id|>":
+        audio_chunk = torch.stack(audio_token_buffer[:chunk_size], dim=1)
+        num_codebooks = audio_chunk.shape[0]
+        
+        vq_code = revert_delay_pattern(audio_chunk).clip(0, serve_engine.audio_codebook_size - 1)
+        wv_numpy = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
+        
+        audio_data.extend(wv_numpy.tolist())
+
+        # Write to stdout asynchronously        
+        # loop = asyncio.get_running_loop()
+        # loop.run_in_executor(None, sys.stdout.buffer.write, pcm_data.tobytes())
+        # loop.run_in_executor(None, sys.stdout.buffer.flush)
+    
+        # Calculate how many tokens to keep for next chunk
+        # We need to preserve the tokens that were cut off by the delay pattern
+        # Keep the last (num_codebooks - 1) tokens to maintain continuity
+        tokens_to_keep = num_codebooks - 1
+        audio_token_buffer = audio_token_buffer[chunk_size - tokens_to_keep:]
+
+
+async def generate_audio(sample, serve_engine):
+    output: HiggsAudioResponse = serve_engine.generate(
+        chat_ml_sample=sample,
+        max_new_tokens=1024,
+        temperature=0.3,
+        top_p=0.95,
+        top_k=50,
+        stop_strings=["<|end_of_text|>", "<|eot_id|>"],
+        seed=42,
+    )
+
+    return output.audio.tolist(), output.sampling_rate
+
+
+async def generate_audio_stream(sample, serve_engine):
+    streamer: AsyncGenerator[HiggsAudioStreamerDelta, None] = serve_engine.generate_delta_stream(
+        chat_ml_sample=sample,
+        max_new_tokens=1024,
+        temperature=0.3,
+        top_p=0.95,
+        top_k=50,
+        stop_strings=["<|end_of_text|>", "<|eot_id|>"],
+        seed=42,
+    )
+
+    global audio_data
+    sampling_rate = serve_engine.audio_tokenizer.sampling_rate
+    
+    async for delta in streamer:
+        await process_audio_tokens_to_pcm(delta, serve_engine)
+
+    return audio_data, sampling_rate
+
+
+async def generate_audio_from_api(sample):
     current_chunk = ""
 
     response = requests.post(
@@ -100,7 +171,7 @@ async def run_test():
     )
 
     audio_data = []
-    sampling_rate = 16000
+    sampling_rate = None
 
     for chunk in response.iter_content(chunk_size=1024):
         if chunk:            
@@ -115,16 +186,42 @@ async def run_test():
 
             try:
                 data = json.loads(current_chunk)
+                print(data)
                 audio_data.extend(data["audio"])
                 sampling_rate = data["sampling_rate"]
-
-                print(data)
             except json.JSONDecodeError:
                 pass
 
-    print(len(audio_data))
+    return audio_data, sampling_rate
 
-    torchaudio.save("output.wav", torch.tensor(audio_data)[None, :], sampling_rate)
+
+async def run_test():
+    sample = get_voice_clone_input_sample()
+    
+    MODEL_PATH = "checkpoints/bosonai/higgs-audio-v2-generation-3B-base"
+    AUDIO_TOKENIZER_PATH = "checkpoints/bosonai/higgs-audio-v2-tokenizer"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    serve_engine = HiggsAudioServeEngine(
+        MODEL_PATH,
+        AUDIO_TOKENIZER_PATH,
+        device=device,
+    )
+
+    # audio_data, sampling_rate = await generate_audio(sample, serve_engine)
+    # with open("output.json", "w") as f:
+    #     json.dump(audio_data, f)
+    # torchaudio.save("output.wav", torch.tensor(audio_data)[None, :], sampling_rate)
+
+    # audio_data, sampling_rate = await generate_audio_stream(sample, serve_engine)
+    # with open("output_stream.json", "w") as f:
+    #     json.dump(audio_data, f)
+    # torchaudio.save("output_stream.wav", torch.tensor(audio_data)[None, :], sampling_rate)
+
+    audio_data, sampling_rate = await generate_audio_from_api(sample)
+    with open("output_api.json", "w") as f:
+        json.dump(audio_data, f)
+    torchaudio.save("output_api.wav", torch.tensor(audio_data)[None, :], sampling_rate)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import uuid
 import json
 import asyncio
 import base64
+from boson_multimodal.model.higgs_audio.utils import revert_delay_pattern
 import uvicorn
 from typing import AsyncGenerator, Dict, Any, Optional, List
 from contextlib import asynccontextmanager
@@ -23,7 +24,7 @@ from huggingface_hub import snapshot_download
 from boson_multimodal.serve.serve_engine import HiggsAudioStreamerDelta, HiggsAudioResponse, HiggsAudioServeEngine
 from boson_multimodal.data_types import ChatMLSample, Message, AudioContent
 from oai_models import ChatCompletionMessageParam, ChatCompletionRequest
-from schema import AudioChunk, ResponseStatus, TaskStatus
+from schema import AudioChunk, AudioGenerationRequest, ResponseStatus, TaskStatus
 
 
 async def send_chunk(chunk_obj):
@@ -116,19 +117,15 @@ app = FastAPI(
 )
 
 
-def openai_messages_to_chatml_messages(messages: List[ChatCompletionMessageParam]) -> List[Message]:
-    return [Message(**message) for message in messages]
-
-
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, original_request: Request):
+async def chat_completions(request: AudioGenerationRequest, original_request: Request):
     async def optimized_stream_generator():
         try:
             task_id = str(uuid.uuid4())
 
             streamer: AsyncGenerator[HiggsAudioStreamerDelta, None] = serve_engine.generate_delta_stream(
-                chat_ml_sample=ChatMLSample(messages=openai_messages_to_chatml_messages(request.messages)),
+                chat_ml_sample=ChatMLSample(messages=request.messages),
                 max_new_tokens=request.max_completion_tokens or 1024,
                 temperature=request.temperature or 0.3,
                 top_p=request.top_p or 0.95,
@@ -137,19 +134,52 @@ async def chat_completions(request: ChatCompletionRequest, original_request: Req
                 seed=request.seed or 42,
             )
             
+            audio_token_buffer = []
+            chunk_size = 64
+            
             async for delta in streamer:
-                is_final_chunk = delta.text is not None
+                if delta.audio_tokens is not None:
+                    audio_token_buffer.append(delta.audio_tokens)
 
-                chunk_obj = AudioChunk(
-                    id=task_id,
-                    audio=delta.audio_tokens.tolist() if delta.audio_tokens is not None else [],
-                    status=ResponseStatus(status=TaskStatus.COMPLETED, progress=99.0, estimated_wait_time=None),
-                    finish_reason="stop" if is_final_chunk else None,
-                    sampling_rate=serve_engine.audio_tokenizer.sampling_rate,
-                )
+                is_final_chunk = delta.text == "<|eot_id|>"
+                
+                if len(audio_token_buffer) >= chunk_size or is_final_chunk:
+                    audio_chunk = torch.stack(audio_token_buffer[:chunk_size], dim=1)
+                    num_codebooks = audio_chunk.shape[0]
+                    
+                    vq_code = revert_delay_pattern(audio_chunk).clip(0, serve_engine.audio_codebook_size - 1)
+                    wv_numpy = serve_engine.audio_tokenizer.decode(vq_code.unsqueeze(0))[0, 0]
 
-                async for chunk in send_chunk(chunk_obj):
-                    yield chunk
+                    print(wv_numpy.tolist())
+                
+                    # Calculate how many tokens to keep for next chunk
+                    # We need to preserve the tokens that were cut off by the delay pattern
+                    # Keep the last (num_codebooks - 1) tokens to maintain continuity
+                    tokens_to_keep = num_codebooks - 1
+                    audio_token_buffer = audio_token_buffer[chunk_size - tokens_to_keep:]
+
+                    if wv_numpy.shape[0] > 0:
+                        chunk_obj = AudioChunk(
+                            id=task_id,
+                            content=delta.text,
+                            audio=wv_numpy.tolist(),
+                            status=ResponseStatus(status=TaskStatus.COMPLETED, progress=99.0, estimated_wait_time=None),
+                            finish_reason=None,
+                            sampling_rate=serve_engine.audio_tokenizer.sampling_rate,
+                        )
+
+                    if is_final_chunk:
+                        chunk_obj = AudioChunk(
+                            id=task_id,
+                            content=delta.text,
+                            audio=[],
+                            status=ResponseStatus(status=TaskStatus.COMPLETED, progress=99.0, estimated_wait_time=None),
+                            finish_reason="stop",
+                            sampling_rate=serve_engine.audio_tokenizer.sampling_rate,
+                        )
+
+                    async for chunk in send_chunk(chunk_obj):
+                        yield chunk
 
             yield "data: [DONE]\n\n"
         except Exception as e:
